@@ -7,8 +7,10 @@ A custom node plugin that allows you to download and backup all your ComfyUI cus
 - List all installed custom nodes/plugins
 - Download individual plugins as ZIP archives
 - Batch download all plugins at once
+- **Upload a ZIP to install a plugin into `custom_nodes/`** (with overwrite confirmation)
 - Search/filter plugins by name
 - Shows file count and size for each plugin
+- Zip-slip protected extraction, 500 MB upload size limit
 
 ## Installation
 
@@ -26,6 +28,7 @@ git clone https://github.com/huihuihuiz/plugin_downloader
 1. Open ComfyUI
 2. Click the "插件下载器" button in the menu, or visit `http://your-comfyui-address/plugin_downloader`
 3. Browse and download your plugins
+4. Click **上传 ZIP 安装插件** to install a new plugin from a local zip file; restart ComfyUI afterwards to load it
 
 ## Web Interface
 

@@ -1,9 +1,13 @@
 import os
+import shutil
 import zipfile
 import io
 import folder_paths
 from server import PromptServer
 from aiohttp import web
+
+# Max upload size: 500 MB
+MAX_UPLOAD_SIZE = 500 * 1024 * 1024
 
 # ---------------------------------------
 # Secure path join helper
@@ -154,6 +158,129 @@ async def download_plugin_endpoint(request):
 
 
 # ---------------------------------------
+# Upload a plugin zip -> extract into custom_nodes/
+# ---------------------------------------
+@PromptServer.instance.routes.post("/plugin_downloader/upload")
+async def upload_plugin_endpoint(request):
+    try:
+        # Size check via Content-Length
+        content_length = request.content_length or 0
+        if content_length > MAX_UPLOAD_SIZE:
+            return web.json_response(
+                {"error": f"File too large (> {MAX_UPLOAD_SIZE // (1024*1024)} MB)"},
+                status=413,
+            )
+
+        reader = await request.multipart()
+        field = await reader.next()
+        if field is None or field.name != "file":
+            return web.json_response({"error": "Missing upload field 'file'"}, status=400)
+
+        filename = (field.filename or "").strip()
+        if not filename.lower().endswith(".zip"):
+            return web.json_response({"error": "Only .zip files are allowed"}, status=400)
+
+        overwrite = request.query.get("overwrite", "0") == "1"
+
+        # Read into memory with hard size cap
+        buf = io.BytesIO()
+        total = 0
+        while True:
+            chunk = await field.read_chunk(64 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_UPLOAD_SIZE:
+                return web.json_response(
+                    {"error": f"File too large (> {MAX_UPLOAD_SIZE // (1024*1024)} MB)"},
+                    status=413,
+                )
+            buf.write(chunk)
+        buf.seek(0)
+
+        # Validate zip
+        try:
+            zf = zipfile.ZipFile(buf)
+        except zipfile.BadZipFile:
+            return web.json_response({"error": "Invalid zip file"}, status=400)
+
+        custom_nodes_dir = os.path.abspath(get_custom_nodes_directory())
+
+        # Decide target plugin folder name:
+        # 1) if all entries share a common top-level folder, use it
+        # 2) otherwise use the zip filename (without .zip) as the folder
+        names = [n for n in zf.namelist() if n and not n.startswith("__MACOSX/")]
+        if not names:
+            return web.json_response({"error": "Empty zip"}, status=400)
+
+        tops = set()
+        for n in names:
+            first = n.split("/", 1)[0]
+            tops.add(first)
+
+        if len(tops) == 1 and any(n.startswith(list(tops)[0] + "/") for n in names):
+            target_name = list(tops)[0]
+            strip_prefix = ""  # keep structure as-is
+        else:
+            target_name = os.path.splitext(os.path.basename(filename))[0]
+            strip_prefix = ""
+
+        # Forbid special/relative names
+        if target_name in ("", ".", "..") or "/" in target_name or "\\" in target_name:
+            return web.json_response({"error": "Illegal plugin name in zip"}, status=400)
+
+        try:
+            target_dir = safe_join(custom_nodes_dir, target_name)
+        except ValueError:
+            return web.json_response({"error": "Forbidden target path"}, status=403)
+
+        if os.path.exists(target_dir):
+            if not overwrite:
+                return web.json_response(
+                    {"error": f"Plugin '{target_name}' already exists. Retry with overwrite=1 to replace."},
+                    status=409,
+                )
+            shutil.rmtree(target_dir, ignore_errors=True)
+
+        # Safe extraction with zip-slip defense
+        extracted_files = 0
+        for member in zf.infolist():
+            member_name = member.filename
+            if member_name.startswith("__MACOSX/") or member_name.endswith("/.DS_Store"):
+                continue
+            # Normalize path
+            rel = member_name
+            if not tops or (len(tops) == 1 and rel.startswith(list(tops)[0] + "/")):
+                rel = rel.split("/", 1)[1] if "/" in rel else ""
+            if rel == "":
+                continue
+            try:
+                dest_path = safe_join(target_dir, rel)
+            except ValueError:
+                return web.json_response({"error": "Malicious path detected in zip"}, status=400)
+            if member.is_dir():
+                os.makedirs(dest_path, exist_ok=True)
+                continue
+            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+            with zf.open(member) as src, open(dest_path, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+            extracted_files += 1
+
+        zf.close()
+
+        return web.json_response(
+            {
+                "message": f"Successfully installed plugin '{target_name}' ({extracted_files} files). Please restart ComfyUI to load it.",
+                "plugin": target_name,
+                "files": extracted_files,
+            },
+            status=200,
+        )
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+
+# ---------------------------------------
 # Web UI (HTML embedded)
 # ---------------------------------------
 @PromptServer.instance.routes.get("/plugin_downloader")
@@ -200,6 +327,8 @@ button:disabled{background-color:#ccc;cursor:not-allowed;}
 <div class="button-group">
 <button id="refreshBtn" class="refresh-btn">刷新列表</button>
 <button id="downloadAllBtn" class="download-all-btn">下载所有插件</button>
+<input type="file" id="uploadInput" accept=".zip" style="display:none">
+<button id="uploadBtn" class="download-btn">上传 ZIP 安装插件</button>
 </div>
 
 <div id="errorDiv" class="error"></div>
@@ -295,6 +424,50 @@ async function downloadAllPlugins() {
     downloadAllBtn.disabled = false;
     setTimeout(() => { progressDiv.style.display = 'none'; }, 3000);
 }
+
+async function uploadPlugin(file, overwrite) {
+    const progressDiv = document.getElementById('progressDiv');
+    const errorDiv = document.getElementById('errorDiv');
+    errorDiv.style.display = 'none';
+    progressDiv.style.display = 'block';
+    progressDiv.textContent = `正在上传 ${file.name} ...`;
+
+    const form = new FormData();
+    form.append('file', file);
+    const url = `${baseUrl}/plugin_downloader/upload` + (overwrite ? '?overwrite=1' : '');
+
+    try {
+        const resp = await fetch(url, { method: 'POST', body: form });
+        const data = await resp.json();
+        if (resp.status === 409 && !overwrite) {
+            if (confirm(`插件已存在：${data.error}\n是否覆盖安装？`)) {
+                return uploadPlugin(file, true);
+            }
+            progressDiv.style.display = 'none';
+            return;
+        }
+        if (!resp.ok) {
+            errorDiv.textContent = `上传失败: ${data.error || resp.status}`;
+            errorDiv.style.display = 'block';
+            progressDiv.style.display = 'none';
+            return;
+        }
+        progressDiv.textContent = data.message || '上传成功';
+        loadPluginList();
+        setTimeout(() => { progressDiv.style.display = 'none'; }, 4000);
+    } catch (e) {
+        errorDiv.textContent = `网络错误: ${e.message}`;
+        errorDiv.style.display = 'block';
+        progressDiv.style.display = 'none';
+    }
+}
+
+document.getElementById('uploadBtn').onclick = () => document.getElementById('uploadInput').click();
+document.getElementById('uploadInput').onchange = (e) => {
+    const f = e.target.files && e.target.files[0];
+    if (f) uploadPlugin(f, false);
+    e.target.value = '';
+};
 
 document.getElementById('refreshBtn').onclick = loadPluginList;
 document.getElementById('downloadAllBtn').onclick = downloadAllPlugins;
