@@ -1,0 +1,11 @@
+[project]
+name = "plugin_downloader"
+description = "A ComfyUI custom node for downloading and backing up all custom nodes/plugins as ZIP files."
+version = "1.0.0"
+license = { text = "MIT" }
+requires-python = ">= 3.9"
+
+[tool.comfy]
+PublisherId = "huihuihuiz"
+DisplayName = "Plugin Downloader for ComfyUI"
+Icon = ""
